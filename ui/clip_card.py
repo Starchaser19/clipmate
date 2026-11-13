@@ -5,7 +5,7 @@ ClipMate - 单条剪贴板记录的卡片控件
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
                              QPushButton, QFrame)
 from PyQt6.QtCore import Qt, QSize, pyqtSignal, QTimer
-from PyQt6.QtGui import QPixmap, QFont, QIcon, QColor
+from PyQt6.QtGui import QPixmap, QPixmapCache, QFont, QIcon, QColor
 from io import BytesIO
 
 
@@ -153,14 +153,22 @@ class ImageClipCard(ClipCard):
         # 缩略图
         thumb_data = data.get('image_thumb')
         if thumb_data:
-            pixmap = QPixmap()
-            pixmap.loadFromData(thumb_data)
+            # 缓存缩放后的缩略图，筛选/收藏等全量刷新时不再重复解码
+            cache_key = f'clipmate-thumb-{data["id"]}-{hash(bytes(thumb_data))}'
+            pixmap = QPixmapCache.find(cache_key)
+            if pixmap is None:
+                pixmap = QPixmap()
+                loaded = QPixmap()
+                if loaded.loadFromData(thumb_data):
+                    pixmap = loaded.scaled(
+                        80, 80,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+                    QPixmapCache.insert(cache_key, pixmap)
             thumb_label = QLabel()
-            thumb_label.setPixmap(pixmap.scaled(
-                80, 80,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            ))
+            if not pixmap.isNull():
+                thumb_label.setPixmap(pixmap)
             thumb_label.setFixedSize(80, 80)
             thumb_label.setStyleSheet("background-color: #F3F4F6; border-radius: 4px;")
             layout.addWidget(thumb_label)

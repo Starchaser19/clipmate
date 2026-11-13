@@ -127,5 +127,12 @@ class SplitClipView(QWidget):
             self.status_message.emit(f'无法打开图片: {e}')
 
     def refresh(self):
+        """全量刷新两个列表。"""
         self.text_list.refresh()
         self.image_list.refresh()
+
+    def refresh_new(self) -> bool:
+        """只追加新记录；返回是否有变化。"""
+        changed = self.text_list.refresh_new()
+        changed = self.image_list.refresh_new() or changed
+        return changed

@@ -141,7 +141,7 @@ def get_clips(limit: int = 100, offset: int = 0,
         sql = f"""
             SELECT * FROM clips
             WHERE {where}
-            ORDER BY is_favorite DESC, created_at DESC
+            ORDER BY is_favorite DESC, created_at DESC, id DESC
             LIMIT ? OFFSET ?
         """
         params.extend([limit, offset])
@@ -149,6 +149,119 @@ def get_clips(limit: int = 100, offset: int = 0,
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+# 列表卡片只需要的字段：不读 image_data，避免每次刷新搬运大 BLOB
+_LIST_COLUMNS = "id, content_type, preview, created_at, is_favorite, image_thumb"
+
+
+def get_clips_for_list(limit: int = 200, offset: int = 0,
+                       search: Optional[str] = None,
+                       tag_id: Optional[int] = None,
+                       favorite_only: bool = False,
+                       content_type: Optional[str] = None,
+                       after_id: Optional[int] = None,
+                       conn: Optional[sqlite3.Connection] = None) -> list:
+    """
+    列表页专用查询。
+    - 只取卡片需要的列，不取 image_data / text_content
+    - after_id 用于增量刷新：只取比它新的记录
+    - conn 传入时复用调用方的连接
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
+    try:
+        conditions = []
+        params = []
+
+        if search:
+            conditions.append("(preview LIKE ? OR text_content LIKE ?)")
+            params.extend([f'%{search}%', f'%{search}%'])
+
+        if tag_id is not None:
+            conditions.append("id IN (SELECT clip_id FROM clip_tags WHERE tag_id=?)")
+            params.append(tag_id)
+
+        if favorite_only:
+            conditions.append("is_favorite = 1")
+
+        if content_type:
+            conditions.append("content_type = ?")
+            params.append(content_type)
+
+        if after_id is not None:
+            conditions.append("id > ?")
+            params.append(after_id)
+
+        where = " AND ".join(conditions) if conditions else "1"
+        sql = f"""
+            SELECT {_LIST_COLUMNS} FROM clips
+            WHERE {where}
+            ORDER BY is_favorite DESC, created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def get_tags_for_clips(clip_ids: list,
+                       conn: Optional[sqlite3.Connection] = None) -> dict:
+    """一次查出多条记录的标签，避免每条记录开一次连接。"""
+    if not clip_ids:
+        return {}
+
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
+    try:
+        placeholders = ','.join('?' * len(clip_ids))
+        rows = conn.execute(f"""
+            SELECT ct.clip_id, t.id, t.name, t.color
+            FROM clip_tags ct
+            JOIN tags t ON t.id = ct.tag_id
+            WHERE ct.clip_id IN ({placeholders})
+            ORDER BY t.name
+        """, list(clip_ids)).fetchall()
+
+        result = {cid: [] for cid in clip_ids}
+        for row in rows:
+            result[row['clip_id']].append({
+                'id': row['id'],
+                'name': row['name'],
+                'color': row['color'],
+            })
+        return result
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def get_max_clip_id(content_type: Optional[str] = None,
+                    conn: Optional[sqlite3.Connection] = None) -> int:
+    """返回当前最大 id，GUI 用它判断是否需要增量刷新。"""
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
+    try:
+        if content_type:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS max_id FROM clips "
+                "WHERE content_type=?",
+                (content_type,)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS max_id FROM clips"
+            ).fetchone()
+        return int(row['max_id'])
+    finally:
+        if own_conn:
+            conn.close()
 
 
 def get_clip_by_id(clip_id: int) -> Optional[dict]:

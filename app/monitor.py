@@ -5,10 +5,10 @@ ClipMate - 剪贴板监听模块
 
 import time
 import hashlib
-import traceback
 import logging
 import os
-from threading import Thread, Event
+from logging.handlers import RotatingFileHandler
+from threading import Thread, Event, Lock
 from typing import Optional
 from io import BytesIO
 
@@ -22,11 +22,15 @@ LOG_DIR = os.path.join(os.path.expanduser("~"), ".clipmate")
 LOG_PATH = os.path.join(LOG_DIR, "monitor.log")
 
 os.makedirs(LOG_DIR, exist_ok=True)
-logging.basicConfig(
-    filename=LOG_PATH,
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+_handler = RotatingFileHandler(
+    LOG_PATH,
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
+    encoding='utf-8',
 )
+_handler.setFormatter(logging.Formatter(
+    '%(asctime)s [%(levelname)s] %(message)s'))
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +45,10 @@ class ClipboardMonitor(Thread):
         self._last_text: Optional[str] = None
         self._last_image_hash: Optional[str] = None
         self._paused = False
+        # GUI 通过这个计数判断是否有新记录，不用每 2 秒全量查库
+        self._change_lock = Lock()
+        self._change_seq = 0
+        self._last_clip_error_at = 0.0
 
     def run(self):
         """主循环：持续检测剪贴板变化"""
@@ -80,6 +88,23 @@ class ClipboardMonitor(Thread):
     def is_paused(self) -> bool:
         return self._paused
 
+    def change_seq(self) -> int:
+        """新记录计数。GUI 只比较计数，不变就不刷新列表。"""
+        with self._change_lock:
+            return self._change_seq
+
+    def _mark_changed(self):
+        with self._change_lock:
+            self._change_seq += 1
+
+    def _log_clip_error(self, kind: str):
+        """剪贴板被占用是常见瞬时错误，每分钟最多记一条。"""
+        now = time.monotonic()
+        if now - self._last_clip_error_at >= 60:
+            self._last_clip_error_at = now
+            log.warning(
+                "%s clipboard read failed (clipboard busy?); will retry", kind)
+
     def _init_last_content(self):
         """记录当前剪贴板内容作为基线，避免启动时误添加"""
         try:
@@ -106,15 +131,16 @@ class ClipboardMonitor(Thread):
             if current_text and current_text != self._last_text:
                 self._last_text = current_text
                 cid = add_clip(content_type='text', text_content=current_text)
-                log.info(f"New text clip #{cid}: {current_text[:50]}...")
+                self._mark_changed()
+                log.info(f"New text clip #{cid} ({len(current_text)} chars)")
         except Exception:
-            log.exception("Text clipboard check failed")
+            self._log_clip_error('Text')
 
         # ── 图片 ──
         try:
             self._check_image()
         except Exception:
-            log.exception("Image check failed")
+            self._log_clip_error('Image')
 
     def _check_image(self):
         """用 PIL ImageGrab 检测剪贴板图片（支持所有 Windows 格式）"""
@@ -156,4 +182,5 @@ class ClipboardMonitor(Thread):
             image_data=img_buf.getvalue(),
             image_thumb=thumb_buf.getvalue()
         )
+        self._mark_changed()
         log.info(f"New image clip #{cid}: {img.size}")

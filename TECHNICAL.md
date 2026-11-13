@@ -64,6 +64,18 @@ CREATE TABLE clip_tags (
 - **图片**：计算 PNG 数据的 MD5 哈希，与上次捕获比较，相同则跳过
 - **自复制防护**：ClipMate 自身复制到剪贴板后，调用 `mark_text_seen()` / `mark_image_seen()` 更新监听器基线，避免回环
 
+### 数据清理
+
+`app/maintenance.py` 在每天首次启动时执行一次清理：
+
+- 图片超过 90 天，或图片总量超过 300 MB 时，删除最旧的非收藏/非标签图片
+- 文本超过 365 天
+- `is_favorite=1` 和出现在 `clip_tags` 中的记录永远保留
+- 删除后执行 `VACUUM`，SQLite 文件才会真正缩小
+- 清理时间记录在 `~/.clipmate/last_cleanup`，24 小时内不重复执行
+
+数据库是明文 SQLite，没有加密。敏感内容需要用户手动清空，或收藏策略需要谨慎使用。
+
 ---
 
 ## 三、剪贴板监听
@@ -75,6 +87,12 @@ while not stopped:
     check_clipboard()    # 检查文本 + 图片
     sleep(0.5)           # 0.5 秒间隔
 ```
+
+### 变更通知
+
+监听线程每写入一条新记录就递增 `change_seq`（`threading.Lock` 保护）。
+GUI 的 2 秒定时器只比较这个计数，计数不变时不做任何查询。
+计数变化时调用 `refresh_new()`，只追加新卡片，不重建已有列表。
 
 ### 文本检测
 
@@ -101,7 +119,13 @@ if img:
 
 ### 线程安全
 
-监听线程是 Python daemon 线程，主进程退出时自动终止。Python GIL 保证了字符串/字节赋值的原子性。SQLite WAL 模式支持一写多读并发。
+监听线程是 Python daemon 线程，主进程退出时自动终止。Python GIL 保证了字符串/字节赋值的原子性。`change_seq` 用 `threading.Lock` 保护。SQLite WAL 模式支持一写多读并发。
+
+### 日志
+
+`monitor.log` 使用 `RotatingFileHandler`：单文件 5 MB，保留 3 份，总计不超过约 20 MB。
+剪贴板被其他程序占用时，每分钟最多记录一条警告，不再每次写完整 Traceback。
+日志只记录新记录的数量/长度/图片尺寸，不记录复制文本的内容。
 
 ---
 
@@ -143,6 +167,14 @@ Qt 双击事件序列：`press → release → press → doubleClick → release
 ```
 
 关键：双击后第二次 `mouseReleaseEvent` 会重新启动计时器，需用 `_skip_release` 标记跳过。
+
+### 托盘打开与任务栏图标
+
+托盘打开调用 `show_and_raise()`。它先 `show()`，再用 `QTimer.singleShot(0, ...)` 延后列表更新。
+任务栏在窗口显示后会发送 `WM_GETICON` 查询窗口图标。
+GUI 线程忙时查询会超时，Windows 回退到窗口类图标 `IDI_APPLICATION`，显示为通用应用图标。
+因此 `_after_show()` 在列表更新完成后再设置一次窗口图标。
+列表查询改为只读轻量字段后，全量刷新从 2.09 秒降到约 0.4~0.6 秒；增量刷新通常低于 10 毫秒。
 
 ### 自复制回环防护
 
@@ -188,6 +220,16 @@ winreg.DeleteValue(key, "ClipMate")
 
 托盘右键 → 勾选 `🚀 开机自启` → 写入注册表 → 立即生效。取消勾选则删除键值。
 
+### 单实例锁
+
+`main.py` 在启动时创建会话级命名互斥体 `Local\ClipMate.SingleInstance`。
+如果 `GetLastError()` 返回 `ERROR_ALREADY_EXISTS`，说明已有实例在运行：
+
+- 普通启动：弹出提示“ClipMate 已在运行（系统托盘）”，然后退出
+- `--hidden` 启动：静默退出，避免开机自启和手动启动打架
+
+互斥体句柄保存在模块级变量中，进程退出时由系统释放。
+
 ---
 
 ## 六、打包原理 (PyInstaller)
@@ -195,8 +237,10 @@ winreg.DeleteValue(key, "ClipMate")
 ### 打包命令
 
 ```
-pyinstaller --onefile --windowed --name ClipMate --icon app_icon.ico --add-data "resources/..." main.py
+pyinstaller --noconfirm ClipMate.spec
 ```
+
+`ClipMate.spec` 已经声明了 `--onefile`、`--windowed`、图标和 `resources/icons` 数据文件。
 
 ### 各阶段
 
@@ -268,7 +312,13 @@ def resource_path(relative_path):
   SQLite DB (clipmate.db)
         │
         ▼
-  ClipListWidget.refresh() (每 2s)
+  ClipboardMonitor.change_seq 递增
+        │
+        ▼
+  _auto_refresh 每 2s 比较计数
+        │ 有变化
+        ▼
+  ClipListWidget.refresh_new() 只追加新卡片
         │
         ▼
   用户看到界面更新
@@ -288,4 +338,3 @@ def resource_path(relative_path):
 | Pillow | ≥10.0 | ImageGrab 图片抓取、缩略图、格式转换 |
 | pyperclip | ≥1.9 | 跨平台文本剪贴板读写 |
 | pywin32 | ≥306 | win32clipboard(DIB 格式操作)、winreg(注册表)、win32con |
-| keyboard | ≥0.13 | 全局热键（预留，当前未使用） |

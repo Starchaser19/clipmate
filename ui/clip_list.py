@@ -16,12 +16,15 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QAction
 
 from .clip_card import ClipCard, ImageClipCard
-from app.database import (get_clips, get_clip_by_id, get_connection,
-                          delete_clip, toggle_favorite, get_clip_tags)
+from app.database import (get_clips_for_list, get_tags_for_clips,
+                          get_max_clip_id, get_clip_by_id, get_connection,
+                          delete_clip, toggle_favorite)
 
 
 class ClipListWidget(QWidget):
     """单一类型的剪贴板列表控件"""
+
+    LIMIT = 200
 
     clip_copied = pyqtSignal(str)
     image_preview = pyqtSignal(bytes)   # 点击图片 → 请求预览
@@ -34,6 +37,8 @@ class ClipListWidget(QWidget):
         self._search_text = ''
         self._favorite_only = False
         self._title = title
+        self._cards = []            # 按显示顺序保存卡片，便于增量插入
+        self._last_max_id = None    # 上次刷新时的最大 id
         self._setup_ui()
 
     def _setup_ui(self):
@@ -106,22 +111,25 @@ class ClipListWidget(QWidget):
         self.refresh()
 
     def refresh(self):
-        clips = get_clips(
-            limit=200,
-            search=self._search_text if self._search_text else None,
-            favorite_only=self._favorite_only,
-            content_type=self._content_type
-        )
+        """全量刷新：筛选、删除、收藏、标签变化时调用。"""
+        conn = get_connection()
+        try:
+            clips = get_clips_for_list(
+                limit=self.LIMIT,
+                search=self._search_text or None,
+                favorite_only=self._favorite_only,
+                content_type=self._content_type,
+                conn=conn
+            )
+            tags = get_tags_for_clips([clip['id'] for clip in clips], conn=conn)
+            self._last_max_id = get_max_clip_id(self._content_type, conn=conn)
+        finally:
+            conn.close()
 
         for clip in clips:
-            clip['tags'] = get_clip_tags(clip['id'])
+            clip['tags'] = tags.get(clip['id'], [])
 
-        # 清旧卡片
-        for i in reversed(range(self.list_layout.count())):
-            w = self.list_layout.itemAt(i).widget()
-            if w and w != self.empty_label:
-                w.deleteLater()
-
+        self._clear_cards()
         self.count_label.setText(f'{len(clips)} 条')
 
         if not clips:
@@ -131,22 +139,86 @@ class ClipListWidget(QWidget):
         self.empty_label.hide()
 
         for clip in clips:
-            if clip['content_type'] == 'image':
-                card = ImageClipCard(clip)
-                card.double_clicked.connect(self._on_image_double_clicked)
-            else:
-                card = ClipCard(clip)
-
-            card.clicked.connect(self._on_card_clicked)
-            card.favorite_toggled.connect(self._on_favorite_toggled)
-            card.delete_requested.connect(self._on_delete_requested)
-
-            card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            card.customContextMenuRequested.connect(
-                lambda pos, cid=clip['id']: self._show_card_menu(pos, cid)
-            )
-
+            card = self._make_card(clip)
+            self._cards.append(card)
             self.list_layout.addWidget(card)
+
+    def refresh_new(self) -> bool:
+        """
+        增量刷新：只追加比上次刷新更新的记录。
+        没有新记录时只执行一次轻量查询，不重建任何卡片。
+        """
+        if self._favorite_only or self._search_text:
+            return False
+        if self._last_max_id is None:
+            return False
+
+        conn = get_connection()
+        try:
+            clips = get_clips_for_list(
+                limit=self.LIMIT,
+                content_type=self._content_type,
+                after_id=self._last_max_id,
+                conn=conn
+            )
+            if not clips:
+                return False
+            tags = get_tags_for_clips([clip['id'] for clip in clips], conn=conn)
+        finally:
+            conn.close()
+
+        for clip in clips:
+            clip['tags'] = tags.get(clip['id'], [])
+
+        if not self.empty_label.isHidden():
+            self.empty_label.hide()
+
+        # 收藏卡片固定在最上面，新记录插到收藏区之后
+        insert_pos = sum(1 for card in self._cards if card.is_favorite)
+        layout_base = self.list_layout.indexOf(self.empty_label) + 1
+
+        for clip in clips:
+            card = self._make_card(clip)
+            self._cards.insert(insert_pos, card)
+            self.list_layout.insertWidget(layout_base + insert_pos, card)
+            insert_pos += 1
+
+        self._last_max_id = max(self._last_max_id, max(clip['id'] for clip in clips))
+        self._trim_to_limit()
+        self.count_label.setText(f'{len(self._cards)} 条')
+        return True
+
+    def _make_card(self, clip: dict):
+        """创建卡片并连接信号/右键菜单。"""
+        if clip['content_type'] == 'image':
+            card = ImageClipCard(clip)
+            card.double_clicked.connect(self._on_image_double_clicked)
+        else:
+            card = ClipCard(clip)
+
+        card.clicked.connect(self._on_card_clicked)
+        card.favorite_toggled.connect(self._on_favorite_toggled)
+        card.delete_requested.connect(self._on_delete_requested)
+
+        card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        card.customContextMenuRequested.connect(
+            lambda pos, cid=clip['id']: self._show_card_menu(pos, cid)
+        )
+        return card
+
+    def _clear_cards(self):
+        for card in self._cards:
+            card.hide()
+            self.list_layout.removeWidget(card)
+            card.deleteLater()
+        self._cards.clear()
+
+    def _trim_to_limit(self):
+        while len(self._cards) > self.LIMIT:
+            card = self._cards.pop()
+            card.hide()
+            self.list_layout.removeWidget(card)
+            card.deleteLater()
 
     # ── 卡片交互 ──
 

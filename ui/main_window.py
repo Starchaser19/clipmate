@@ -18,6 +18,7 @@ from PyQt6.QtGui import (QIcon, QAction, QFont, QPixmap, QPainter,
 from .title_bar import TitleBar
 from .split_view import SplitClipView
 from app.database import init_db, get_all_tags, add_tag, delete_tag, clear_history
+from app.maintenance import maybe_cleanup
 from app.monitor import ClipboardMonitor
 from app.autostart import is_enabled as autostart_enabled, toggle as autostart_toggle
 from app.utils import resource_path
@@ -47,6 +48,7 @@ class MainWindow(QMainWindow):
 
         # ── 4. 数据库 + 监听器 ──
         init_db()
+        maybe_cleanup()   # 每天最多一次；清理旧记录并回收空间
         self.monitor = ClipboardMonitor()
         self.monitor.start()
 
@@ -60,7 +62,8 @@ class MainWindow(QMainWindow):
         self._refresh_timer.timeout.connect(self._auto_refresh)
         self._refresh_timer.start(2000)
 
-        # 首次加载数据
+        # 首次加载数据。先记下变更计数，避免刷新期间新到的记录被漏掉
+        self._last_change_seq = self.monitor.change_seq()
         self.split_view.refresh()
 
         # 修复无边框窗口的边缘缩放（加回 WS_THICKFRAME）
@@ -333,11 +336,20 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════
 
     def show_and_raise(self):
-        """显示窗口并提升到最前"""
+        """显示窗口并提升到最前。先让窗口显示，再做列表更新。"""
         self.show()
         self.raise_()
         self.activateWindow()
-        self.split_view.refresh()
+        # 不在 show 的同一个事件里做重活：让任务栏先取到窗口图标
+        QTimer.singleShot(0, self._after_show)
+
+    def _after_show(self):
+        """窗口显示后的轻量更新 + 图标兜底。"""
+        self._last_change_seq = self.monitor.change_seq()
+        self.split_view.refresh_new()
+        # 任务栏在窗口刚显示时查询图标可能超时，刷新后再设一次，
+        # 确保显示应用图标，而不是 Windows 通用图标
+        self._set_window_icon()
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -366,8 +378,19 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(3000, lambda: self.status_bar.setText('就绪 | 后台监听中...'))
 
     def _auto_refresh(self):
-        if self.isVisible() and not self.split_view.search_input.text():
-            self.split_view.refresh()
+        if not self.isVisible():
+            return
+
+        # 搜索/仅收藏时，新记录不会出现在当前列表里
+        if self.split_view.search_input.text() or self.split_view.fav_btn.isChecked():
+            self._last_change_seq = self.monitor.change_seq()
+            return
+
+        seq = self.monitor.change_seq()
+        if seq == self._last_change_seq:
+            return
+        self._last_change_seq = seq
+        self.split_view.refresh_new()
 
     def _show_tag_manager(self):
         from .tag_dialog import TagManageDialog
